@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const { google } = require('googleapis');
 
 const app = express();
 app.use(cors());
@@ -58,6 +59,56 @@ function appendAppointment(row) {
   ensureCsv();
   const line = CSV_HEADERS.map((h) => csvEscape(row[h])).join(',') + '\n';
   fs.appendFileSync(CSV_PATH, line);
+}
+
+// ---------------- Google Sheets (live copy for doctor/staff to view) ----------------
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+
+let sheetsClientPromise = null;
+function getSheetsClient() {
+  if (!sheetsClientPromise) {
+    const auth = new google.auth.JWT(
+      GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      null,
+      GOOGLE_PRIVATE_KEY,
+      ['https://www.googleapis.com/auth/spreadsheets']
+    );
+    sheetsClientPromise = Promise.resolve(google.sheets({ version: 'v4', auth }));
+  }
+  return sheetsClientPromise;
+}
+
+async function appendToGoogleSheet(row) {
+  if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+    console.log('Google Sheets env vars set nahi hain, skip kar rahe hain.');
+    return;
+  }
+  try {
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A:I',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[
+          row.token, row.name, row.phone, row.problem,
+          row.doctor, row.specialty, row.date, row.time, row.booked_at,
+        ]],
+      },
+    });
+  } catch (err) {
+    console.error('Google Sheets mein likhne mein error:', err.message);
+  }
+}
+
+// Ye function CSV (fast, booking-logic ke liye) aur Google Sheet (doctor
+// dekhne ke liye) dono jagah ek saath save karta hai — hamesha isi ko
+// call karein, seedha appendAppointment ko nahi.
+async function saveAppointment(row) {
+  appendAppointment(row);
+  await appendToGoogleSheet(row);
 }
 function nextSlot(doctorName) {
   const appts = readAppointments();
@@ -134,7 +185,7 @@ app.post('/chat', async (req, res) => {
         time: slot.time,
         booked_at: new Date().toISOString(),
       };
-      appendAppointment(row);
+      await saveAppointment(row);
 
       const followUp = await anthropic.messages.create({
         model: 'claude-sonnet-5',
@@ -193,17 +244,22 @@ function formatTimeDisplay(hhmm) {
 
 const SLOT_TIMES_24H = ['10:00', '10:20', '10:40', '11:00', '11:20', '16:00', '16:20', '16:40'];
 
-app.post('/api/check-and-book', (req, res) => {
+app.post('/api/check-and-book', async (req, res) => {
   const { name, phone, problem, doctor_name, requested_date, requested_time } = req.body;
+  console.log('--- check-and-book called ---');
+  console.log('Received body:', JSON.stringify(req.body));
 
   const doctor = DOCTORS.find((d) => d.name === doctor_name) || DOCTORS[0];
   const dateKey = (requested_date || '').trim();
   const timeKey = (requested_time || '').trim();
 
   const appts = readAppointments();
+  console.log('Total existing appointments in file:', appts.length);
   const clash = appts.find(
     (a) => a.doctor === doctor.name && a.date_key === dateKey && a.time_key === timeKey
   );
+  console.log('Looking for match: doctor=', doctor.name, 'dateKey=', dateKey, 'timeKey=', timeKey);
+  console.log('Clash found?', !!clash);
 
   if (clash) {
     const dayCount = appts.filter((a) => a.doctor === doctor.name && a.date_key === dateKey).length;
@@ -231,7 +287,7 @@ app.post('/api/check-and-book', (req, res) => {
     time: formatTimeDisplay(timeKey),
     booked_at: new Date().toISOString(),
   };
-  appendAppointment(row);
+  await saveAppointment(row);
 
   res.json({
     available: true,
@@ -284,7 +340,7 @@ app.post('/whatsapp-webhook', async (req, res) => {
         time: slot.time,
         booked_at: new Date().toISOString(),
       };
-      appendAppointment(row);
+      await saveAppointment(row);
 
       const followUp = await anthropic.messages.create({
         model: 'claude-sonnet-5',
