@@ -370,5 +370,37 @@ app.post('/whatsapp-webhook', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Clinic voice agent backend chal raha hai.'));
 
+// ---------------- Debug endpoint (browser mein khol ke dekh sakte hain) ----------------
+app.get('/debug-sheets', async (req, res) => {
+  const status = {
+    GOOGLE_SHEET_ID_set: !!GOOGLE_SHEET_ID,
+    GOOGLE_SERVICE_ACCOUNT_EMAIL_set: !!GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    GOOGLE_PRIVATE_KEY_set: !!GOOGLE_PRIVATE_KEY,
+    GOOGLE_PRIVATE_KEY_looks_valid: GOOGLE_PRIVATE_KEY.includes('BEGIN PRIVATE KEY'),
+  };
+
+  if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+    return res.json({ ...status, test_write: 'skipped — ek ya zyada environment variable missing hai' });
+  }
+
+  try {
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A:I',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [['DEBUG-TEST', 'debug', 'debug', 'debug', 'debug', 'debug', 'debug', 'debug', new Date().toISOString()]],
+      },
+    });
+    status.test_write = 'SUCCESS — Sheet mein ek test row daal di gayi hai, jaake check karein';
+  } catch (err) {
+    status.test_write = 'FAILED';
+    status.error_message = err.message;
+  }
+
+  res.json(status);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server chal raha hai: http://localhost:${PORT}`));
