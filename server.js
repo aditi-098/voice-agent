@@ -244,10 +244,23 @@ function formatTimeDisplay(hhmm) {
 
 const SLOT_TIMES_24H = ['10:00', '10:20', '10:40', '11:00', '11:20', '16:00', '16:20', '16:40'];
 
+function isValidIndianPhone(phone) {
+  const digits = (phone || '').replace(/\D/g, '');
+  return digits.length === 10;
+}
+
 app.post('/api/check-and-book', async (req, res) => {
   const { name, phone, problem, doctor_name, requested_date, requested_time } = req.body;
   console.log('--- check-and-book called ---');
   console.log('Received body:', JSON.stringify(req.body));
+
+  if (!isValidIndianPhone(phone)) {
+    return res.json({
+      phone_valid: false,
+      available: false,
+      message: 'Ye phone number sahi nahi lag raha. Kripya poora 10-digit mobile number bataiye.',
+    });
+  }
 
   const doctor = DOCTORS.find((d) => d.name === doctor_name) || DOCTORS[0];
   const dateKey = (requested_date || '').trim();
