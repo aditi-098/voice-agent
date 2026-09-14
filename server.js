@@ -556,7 +556,7 @@ app.get('/dashboard', async (req, res) => {
           <td>${a.problem || ''}</td>
           <td>${a.doctor || ''}</td>
         </tr>`).join('')
-    : `<tr><td colspan="6" class="empty">Aaj koi appointment nahi hai.</td></tr>`;
+    : `<tr><td colspan="6" class="empty">No appointments today.</td></tr>`;
 
   res.send(`<!DOCTYPE html>
 <html lang="hi">
@@ -564,7 +564,7 @@ app.get('/dashboard', async (req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="120">
-<title>Sanjeevani Clinic — Aaj ke Appointments</title>
+<title>Sanjeevani Clinic — Today's Appointments</title>
 <style>
   body{ font-family: -apple-system, 'Segoe UI', sans-serif; background:#F2F6F3; margin:0; padding:24px; color:#1B2420; }
   h1{ color:#16423C; font-size:22px; margin-bottom:4px; }
@@ -578,11 +578,11 @@ app.get('/dashboard', async (req, res) => {
 </style>
 </head>
 <body>
-  <h1>Sanjeevani Clinic — Aaj ke Appointments</h1>
-  <p class="sub">${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} — Har 2 minute mein khud refresh hota hai</p>
+  <h1>Sanjeevani Clinic — Today's Appointments</h1>
+  <p class="sub">${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} — Refreshes automatically every 2 minutes</p>
   <table>
     <thead>
-      <tr><th>Token</th><th>Samay</th><th>Naam</th><th>Phone</th><th>Dikkat</th><th>Doctor</th></tr>
+      <tr><th>Token</th><th>Time</th><th>Name</th><th>Phone</th><th>Issue</th><th>Doctor</th></tr>
     </thead>
     <tbody>${rowsHtml}</tbody>
   </table>
