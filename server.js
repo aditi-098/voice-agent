@@ -1,7 +1,7 @@
 // server.js
-// Chhota backend jo browser aur Claude API ke beech mein rehta hai.
-// Yahi agent ka "dimaag" hai — naam/phone/problem samajhna, doctor suggest
-// karna, aur jab sab confirm ho jaaye tab appointment book karna.
+// Small backend that sits between the browser/voice agent and the Claude API.
+// This is the agent's "brain" — understanding name/phone/problem, suggesting
+// a doctor, and booking the appointment once everything is confirmed.
 
 require('dotenv').config();
 const express = require('express');
@@ -15,11 +15,11 @@ const { google } = require('googleapis');
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: false })); // Twilio webhook form-data ke liye
+app.use(express.urlencoded({ extended: false })); // for Twilio webhook form-data
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ---------------- Clinic data (apni clinic ke hisaab se edit karein) ----------------
+// ---------------- Clinic data (edit according to your clinic) ----------------
 const DOCTORS = [
   { name: 'Dr. Ananya Verma', specialty: 'General Physician' },
   { name: 'Dr. Farhan Iyer', specialty: 'Dentist' },
@@ -32,7 +32,11 @@ const DOCTORS = [
 ];
 const SLOT_TIMES = ['10:00 AM', '10:20 AM', '10:40 AM', '11:00 AM', '11:20 AM', '4:00 PM', '4:20 PM', '4:40 PM'];
 
-// ---------------- CSV storage (Excel mein khul jaati hai) ----------------
+// Which day(s) the clinic is closed (0=Sunday, 1=Monday, ... 6=Saturday).
+// Edit according to your clinic. Currently set to closed on Sunday.
+const CLOSED_WEEKDAYS = [0];
+
+// ---------------- CSV storage (opens fine in Excel) ----------------
 const CSV_PATH = path.join(__dirname, 'appointments.csv');
 const CSV_HEADERS = ['token', 'name', 'phone', 'problem', 'doctor', 'specialty', 'date_key', 'time_key', 'date', 'time', 'booked_at'];
 
@@ -82,7 +86,7 @@ function getSheetsClient() {
 
 async function appendToGoogleSheet(row) {
   if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-    console.log('Google Sheets env vars set nahi hain, skip kar rahe hain.');
+    console.log('Google Sheets env vars are not set, skipping.');
     return;
   }
   try {
@@ -100,17 +104,52 @@ async function appendToGoogleSheet(row) {
       },
     });
   } catch (err) {
-    console.error('Google Sheets mein likhne mein error:', err.message);
+    console.error('Error writing to Google Sheets:', err.message);
   }
 }
 
-// Ye function asli "source of truth" hai — CSV file server restart hone par
-// khaali ho sakti hai (Render free tier), lekin Google Sheet hamesha surakshit
-// rehta hai. Isliye clash-detection, token-counting, aur reminders — sab
-// isी function se padhte hain, seedha readAppointments() (CSV) se nahi.
+// This is the real "source of truth" — the CSV file can get wiped when the
+// server restarts (Render free tier), but the Google Sheet always stays
+// safe. So clash-detection, token-counting, and reminders all read from
+// this function, not directly from readAppointments() (CSV).
+// ---------------- Cancellations ----------------
+// Cancelled appointments aren't deleted — instead they're recorded in a
+// second sheet tab named 'Cancellations'. getAllAppointments() automatically
+// filters them out when returning results.
+async function getCancelledKeys() {
+  if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) return new Set();
+  try {
+    const sheets = await getSheetsClient();
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Cancellations!A2:D',
+    });
+    const rows = result.data.values || [];
+    return new Set(rows.map((r) => `${r[0]}_${r[1]}_${r[2]}`)); // token_dateKey_timeKey
+  } catch (err) {
+    console.log('Cancellations tab not found yet (may be the first run):', err.message);
+    return new Set();
+  }
+}
+
+async function markCancelled(token, dateKey, timeKey, phone) {
+  if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) return;
+  try {
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Cancellations!A:D',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [[token, dateKey, timeKey, phone]] },
+    });
+  } catch (err) {
+    console.error('Error writing cancellation:', err.message);
+  }
+}
+
 async function getAllAppointments() {
   if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-    console.log('Google Sheets configure nahi hai, CSV se padh rahe hain (kam bharosemand).');
+    console.log('Google Sheets is not configured, reading from CSV instead (less reliable).');
     return readAppointments();
   }
   try {
@@ -120,6 +159,7 @@ async function getAllAppointments() {
       range: 'Sheet1!A2:K',
     });
     const rows = result.data.values || [];
+    const cancelledKeys = await getCancelledKeys();
     return rows
       .filter((r) => r[0] && r[0] !== 'DEBUG-TEST')
       .map((r) => ({
@@ -134,15 +174,16 @@ async function getAllAppointments() {
         booked_at: r[8],
         date_key: r[9] || '',
         time_key: r[10] || '',
-      }));
+      }))
+      .filter((a) => !cancelledKeys.has(`${a.token}_${a.date_key}_${a.time_key}`));
   } catch (err) {
-    console.error('Google Sheet se padhne mein error, CSV par fallback:', err.message);
+    console.error('Error reading from Google Sheet, falling back to CSV:', err.message);
     return readAppointments();
   }
 }
 
-// Ye function CSV (local backup) aur Google Sheet (asli record) dono jagah
-// ek saath save karta hai — hamesha isi ko call karein.
+// This function saves to both the CSV (local backup) and the Google Sheet
+// (the real record) at the same time — always call this, not appendAppointment directly.
 async function saveAppointment(row) {
   appendAppointment(row);
   await appendToGoogleSheet(row);
@@ -269,11 +310,54 @@ app.get('/appointments', async (req, res) => {
   res.json(await getAllAppointments());
 });
 
+// ---------------- Cancel appointment (for LiveKit Agent Builder) ----------------
+// The patient can give their phone number and (if remembered) the token. If
+// the token isn't known, we look up all active appointments by phone number
+// and cancel it (or show a list if there's more than one).
+app.post('/api/cancel-appointment', async (req, res) => {
+  const { phone, token } = req.body;
+
+  if (!isValidIndianPhone(phone)) {
+    return res.json({ success: false, message: 'Sahi 10-digit phone number bataiye jisse booking hui thi.' });
+  }
+
+  const appts = await getAllAppointments();
+  const digits = phone.replace(/\D/g, '');
+  let matches = appts.filter((a) => (a.phone || '').replace(/\D/g, '') === digits);
+
+  if (token) {
+    matches = matches.filter((a) => String(a.token) === String(token));
+  }
+
+  if (matches.length === 0) {
+    return res.json({ success: false, message: 'Is phone number se koi active appointment nahi mili.' });
+  }
+
+  if (matches.length > 1) {
+    const list = matches
+      .map((a) => `Token T${a.token} - ${a.doctor} - ${a.date} ${a.time}`)
+      .join('; ');
+    return res.json({
+      success: false,
+      message: `Is number se ${matches.length} appointments hain: ${list}. Kripya token number bataiye ki kaunsi cancel karni hai.`,
+    });
+  }
+
+  const appt = matches[0];
+  await markCancelled(appt.token, appt.date_key, appt.time_key, appt.phone);
+
+  res.json({
+    success: true,
+    message: `Aapki appointment (Token T${appt.token}, ${appt.doctor}, ${appt.date} ${appt.time}) cancel kar di gayi hai.`,
+    cancelled: appt,
+  });
+});
+
 // ---------------- Availability check + booking tool (for LiveKit Agent Builder) ----------------
-// Reliability ke liye agent se hamesha FIXED format mangwate hain:
-//   requested_date: DD-MM-YYYY (jaise 10-09-2026)
-//   requested_time: 24-hour HH:MM (jaise 13:00)
-// Isse "1 PM" vs "1:00 pm" jaisi mismatch wali dikkat nahi hoti.
+// For reliability, we always require a FIXED format from the agent:
+//   requested_date: DD-MM-YYYY (e.g. 10-09-2026)
+//   requested_time: 24-hour HH:MM (e.g. 13:00)
+// This avoids mismatches like "1 PM" vs "1:00 pm".
 
 function formatDateDisplay(ddmmyyyy) {
   const m = (ddmmyyyy || '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
@@ -316,6 +400,18 @@ app.post('/api/check-and-book', async (req, res) => {
   const doctor = DOCTORS.find((d) => d.name === doctor_name) || DOCTORS[0];
   const dateKey = (requested_date || '').trim();
   const timeKey = (requested_time || '').trim();
+
+  const dm = dateKey.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (dm) {
+    const [, dd, mm, yyyy] = dm;
+    const checkDate = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
+    if (CLOSED_WEEKDAYS.includes(checkDate.getDay())) {
+      return res.json({
+        available: false,
+        message: `${formatDateDisplay(dateKey)} ko clinic band rehti hai. Kripya koi aur din chunein.`,
+      });
+    }
+  }
 
   const appts = await getAllAppointments();
   console.log('Total existing appointments in file:', appts.length);
@@ -363,11 +459,11 @@ app.post('/api/check-and-book', async (req, res) => {
 });
 
 // ---------------- WhatsApp webhook ----------------
-// Har patient (phone number) ki apni alag conversation yaad rakhte hain.
+// We keep a separate conversation history for each patient (phone number).
 const whatsappConversations = {};
 
 app.post('/whatsapp-webhook', async (req, res) => {
-  const from = req.body.From; // jaise 'whatsapp:+91xxxxxxxxxx'
+  const from = req.body.From; // e.g. 'whatsapp:+91xxxxxxxxxx'
   const incomingText = req.body.Body || '';
 
   if (!whatsappConversations[from]) {
@@ -436,10 +532,68 @@ app.post('/whatsapp-webhook', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Clinic voice agent backend chal raha hai.'));
 
+// ---------------- Dashboard (today's appointments, cleanly displayed) ----------------
+app.get('/dashboard', async (req, res) => {
+  const appts = await getAllAppointments();
+
+  const todayKey = [
+    String(new Date().getDate()).padStart(2, '0'),
+    String(new Date().getMonth() + 1).padStart(2, '0'),
+    new Date().getFullYear(),
+  ].join('-');
+
+  const todayAppts = appts
+    .filter((a) => a.date_key === todayKey)
+    .sort((a, b) => (a.time_key || '').localeCompare(b.time_key || ''));
+
+  const rowsHtml = todayAppts.length
+    ? todayAppts.map((a) => `
+        <tr>
+          <td class="token">T${a.token}</td>
+          <td>${a.time || ''}</td>
+          <td>${a.name || ''}</td>
+          <td>${a.phone || ''}</td>
+          <td>${a.problem || ''}</td>
+          <td>${a.doctor || ''}</td>
+        </tr>`).join('')
+    : `<tr><td colspan="6" class="empty">Aaj koi appointment nahi hai.</td></tr>`;
+
+  res.send(`<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="120">
+<title>Sanjeevani Clinic — Aaj ke Appointments</title>
+<style>
+  body{ font-family: -apple-system, 'Segoe UI', sans-serif; background:#F2F6F3; margin:0; padding:24px; color:#1B2420; }
+  h1{ color:#16423C; font-size:22px; margin-bottom:4px; }
+  p.sub{ color:#4B5A53; font-size:13px; margin-top:0; margin-bottom:20px; }
+  table{ width:100%; border-collapse:collapse; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  th{ background:#16423C; color:#fff; text-align:left; padding:10px 14px; font-size:13px; font-weight:500; }
+  td{ padding:10px 14px; border-bottom:1px solid #E7EFE9; font-size:14px; }
+  tr:last-child td{ border-bottom:none; }
+  .token{ font-weight:600; color:#B98B2E; }
+  .empty{ text-align:center; color:#4B5A53; font-style:italic; padding:24px; }
+</style>
+</head>
+<body>
+  <h1>Sanjeevani Clinic — Aaj ke Appointments</h1>
+  <p class="sub">${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} — Har 2 minute mein khud refresh hota hai</p>
+  <table>
+    <thead>
+      <tr><th>Token</th><th>Samay</th><th>Naam</th><th>Phone</th><th>Dikkat</th><th>Doctor</th></tr>
+    </thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>
+</body>
+</html>`);
+});
+
 // ---------------- Reminders (WhatsApp) ----------------
-// Ye endpoint bahar se (cron-job.org jaisi free service se) har 5-10
-// minute mein hit hoga. Har baar sabhi appointments check karta hai aur
-// jinka reminder time aa gaya hai, unhe WhatsApp message bhejta hai.
+// This endpoint gets hit externally (by a free service like cron-job.org)
+// every 5-10 minutes. Each time, it checks all appointments and sends a
+// WhatsApp message to anyone whose reminder time has arrived.
 
 const SENT_REMINDERS_PATH = path.join(__dirname, 'reminders_sent.txt');
 
@@ -514,7 +668,7 @@ app.get('/run-reminders', async (req, res) => {
   res.json({ checked: appts.length, remindersSent: results.length, details: results });
 });
 
-// ---------------- Debug endpoint (browser mein khol ke dekh sakte hain) ----------------
+// ---------------- Debug endpoint (can be opened directly in a browser) ----------------
 app.get('/debug-sheets', async (req, res) => {
   const status = {
     GOOGLE_SHEET_ID_set: !!GOOGLE_SHEET_ID,
