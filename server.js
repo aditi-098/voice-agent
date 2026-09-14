@@ -89,12 +89,13 @@ async function appendToGoogleSheet(row) {
     const sheets = await getSheetsClient();
     await sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A:I',
+      range: 'Sheet1!A:K',
       valueInputOption: 'USER_ENTERED',
       requestBody: {
         values: [[
           row.token, row.name, row.phone, row.problem,
           row.doctor, row.specialty, row.date, row.time, row.booked_at,
+          row.date_key || '', row.time_key || '',
         ]],
       },
     });
@@ -103,19 +104,67 @@ async function appendToGoogleSheet(row) {
   }
 }
 
-// Ye function CSV (fast, booking-logic ke liye) aur Google Sheet (doctor
-// dekhne ke liye) dono jagah ek saath save karta hai — hamesha isi ko
-// call karein, seedha appendAppointment ko nahi.
+// Ye function asli "source of truth" hai — CSV file server restart hone par
+// khaali ho sakti hai (Render free tier), lekin Google Sheet hamesha surakshit
+// rehta hai. Isliye clash-detection, token-counting, aur reminders — sab
+// isी function se padhte hain, seedha readAppointments() (CSV) se nahi.
+async function getAllAppointments() {
+  if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+    console.log('Google Sheets configure nahi hai, CSV se padh rahe hain (kam bharosemand).');
+    return readAppointments();
+  }
+  try {
+    const sheets = await getSheetsClient();
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A2:K',
+    });
+    const rows = result.data.values || [];
+    return rows
+      .filter((r) => r[0] && r[0] !== 'DEBUG-TEST')
+      .map((r) => ({
+        token: r[0],
+        name: r[1],
+        phone: r[2],
+        problem: r[3],
+        doctor: r[4],
+        specialty: r[5],
+        date: r[6],
+        time: r[7],
+        booked_at: r[8],
+        date_key: r[9] || '',
+        time_key: r[10] || '',
+      }));
+  } catch (err) {
+    console.error('Google Sheet se padhne mein error, CSV par fallback:', err.message);
+    return readAppointments();
+  }
+}
+
+// Ye function CSV (local backup) aur Google Sheet (asli record) dono jagah
+// ek saath save karta hai — hamesha isi ko call karein.
 async function saveAppointment(row) {
   appendAppointment(row);
   await appendToGoogleSheet(row);
 }
-function nextSlot(doctorName) {
-  const appts = readAppointments();
+async function nextSlot(doctorName) {
+  const appts = await getAllAppointments();
   const tomorrow = new Date(Date.now() + 86400000);
   const dateStr = tomorrow.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+  const dateKey = [
+    String(tomorrow.getDate()).padStart(2, '0'),
+    String(tomorrow.getMonth() + 1).padStart(2, '0'),
+    tomorrow.getFullYear(),
+  ].join('-');
   const count = appts.filter((a) => a.doctor === doctorName && a.date === dateStr).length;
-  return { date: dateStr, time: SLOT_TIMES[count % SLOT_TIMES.length], token: count + 1 };
+  const idx = count % SLOT_TIMES.length;
+  return {
+    date: dateStr,
+    time: SLOT_TIMES[idx],
+    date_key: dateKey,
+    time_key: SLOT_TIMES_24H[idx],
+    token: count + 1,
+  };
 }
 
 // ---------------- Claude tool definition ----------------
@@ -173,7 +222,7 @@ app.post('/chat', async (req, res) => {
     if (toolUse && toolUse.name === 'book_appointment') {
       const { name, phone, problem, doctor_name } = toolUse.input;
       const doctor = DOCTORS.find((d) => d.name === doctor_name) || DOCTORS[0];
-      const slot = nextSlot(doctor.name);
+      const slot = await nextSlot(doctor.name);
       const row = {
         token: slot.token,
         name,
@@ -183,6 +232,8 @@ app.post('/chat', async (req, res) => {
         specialty: doctor.specialty,
         date: slot.date,
         time: slot.time,
+        date_key: slot.date_key,
+        time_key: slot.time_key,
         booked_at: new Date().toISOString(),
       };
       await saveAppointment(row);
@@ -214,8 +265,8 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-app.get('/appointments', (req, res) => {
-  res.json(readAppointments());
+app.get('/appointments', async (req, res) => {
+  res.json(await getAllAppointments());
 });
 
 // ---------------- Availability check + booking tool (for LiveKit Agent Builder) ----------------
@@ -266,7 +317,7 @@ app.post('/api/check-and-book', async (req, res) => {
   const dateKey = (requested_date || '').trim();
   const timeKey = (requested_time || '').trim();
 
-  const appts = readAppointments();
+  const appts = await getAllAppointments();
   console.log('Total existing appointments in file:', appts.length);
   const clash = appts.find(
     (a) => a.doctor === doctor.name && a.date_key === dateKey && a.time_key === timeKey
@@ -341,7 +392,7 @@ app.post('/whatsapp-webhook', async (req, res) => {
     if (toolUse && toolUse.name === 'book_appointment') {
       const { name, phone, problem, doctor_name } = toolUse.input;
       const doctor = DOCTORS.find((d) => d.name === doctor_name) || DOCTORS[0];
-      const slot = nextSlot(doctor.name);
+      const slot = await nextSlot(doctor.name);
       const row = {
         token: slot.token,
         name,
@@ -351,6 +402,8 @@ app.post('/whatsapp-webhook', async (req, res) => {
         specialty: doctor.specialty,
         date: slot.date,
         time: slot.time,
+        date_key: slot.date_key,
+        time_key: slot.time_key,
         booked_at: new Date().toISOString(),
       };
       await saveAppointment(row);
@@ -382,6 +435,84 @@ app.post('/whatsapp-webhook', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Clinic voice agent backend chal raha hai.'));
+
+// ---------------- Reminders (WhatsApp) ----------------
+// Ye endpoint bahar se (cron-job.org jaisi free service se) har 5-10
+// minute mein hit hoga. Har baar sabhi appointments check karta hai aur
+// jinka reminder time aa gaya hai, unhe WhatsApp message bhejta hai.
+
+const SENT_REMINDERS_PATH = path.join(__dirname, 'reminders_sent.txt');
+
+function loadSentReminders() {
+  if (!fs.existsSync(SENT_REMINDERS_PATH)) return new Set();
+  return new Set(fs.readFileSync(SENT_REMINDERS_PATH, 'utf8').split('\n').filter(Boolean));
+}
+function markReminderSent(key) {
+  fs.appendFileSync(SENT_REMINDERS_PATH, key + '\n');
+}
+
+function parseAppointmentDateTime(dateKey, timeKey) {
+  // dateKey: DD-MM-YYYY, timeKey: HH:MM (24-hour)
+  const dm = (dateKey || '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  const tm = (timeKey || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!dm || !tm) return null;
+  const [, dd, mm, yyyy] = dm;
+  const [, hh, min] = tm;
+  return new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(min));
+}
+
+async function sendWhatsAppMessage(toPhoneRaw, message) {
+  const digits = (toPhoneRaw || '').replace(/\D/g, '');
+  if (digits.length !== 10) return { skipped: true, reason: 'invalid phone' };
+  const to = `whatsapp:+91${digits}`;
+  const from = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
+  try {
+    const twClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    await twClient.messages.create({ from, to, body: message });
+    return { sent: true };
+  } catch (err) {
+    return { sent: false, error: err.message };
+  }
+}
+
+const REMINDER_STAGES = [
+  { key: '1day', minutesBefore: 24 * 60, windowMin: 15, label: '1 din pehle' },
+  { key: '1hour', minutesBefore: 60, windowMin: 10, label: '1 ghanta pehle' },
+  { key: '30min', minutesBefore: 30, windowMin: 10, label: '30 minute pehle' },
+];
+
+app.get('/run-reminders', async (req, res) => {
+  const appts = await getAllAppointments();
+  const now = new Date();
+  const sentAlready = loadSentReminders();
+  const results = [];
+
+  for (const appt of appts) {
+    const apptDate = parseAppointmentDateTime(appt.date_key, appt.time_key);
+    if (!apptDate) continue;
+
+    const minutesUntil = (apptDate.getTime() - now.getTime()) / 60000;
+
+    for (const stage of REMINDER_STAGES) {
+      const reminderKey = `${appt.token}_${appt.date_key}_${appt.time_key}_${stage.key}`;
+      if (sentAlready.has(reminderKey)) continue;
+
+      const diff = Math.abs(minutesUntil - stage.minutesBefore);
+      if (diff <= stage.windowMin) {
+        const message =
+          stage.key === '30min'
+            ? `Namaste ${appt.name}, aapka number aane wala hai. Token #${appt.token}, ${appt.doctor} ke saath, ${appt.time} baje.`
+            : `Namaste ${appt.name}, ${stage.label} yaad dilana chahte hain — aapki appointment ${appt.date} ko ${appt.time} baje ${appt.doctor} ke saath hai. Token #${appt.token}.`;
+
+        const result = await sendWhatsAppMessage(appt.phone, message);
+        markReminderSent(reminderKey);
+        results.push({ token: appt.token, stage: stage.key, ...result });
+      }
+    }
+  }
+
+  res.json({ checked: appts.length, remindersSent: results.length, details: results });
+});
 
 // ---------------- Debug endpoint (browser mein khol ke dekh sakte hain) ----------------
 app.get('/debug-sheets', async (req, res) => {
