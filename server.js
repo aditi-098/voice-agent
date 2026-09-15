@@ -11,6 +11,7 @@ const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
 const { google } = require('googleapis');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(cors());
@@ -38,7 +39,7 @@ const CLOSED_WEEKDAYS = [0];
 
 // ---------------- CSV storage (opens fine in Excel) ----------------
 const CSV_PATH = path.join(__dirname, 'appointments.csv');
-const CSV_HEADERS = ['token', 'name', 'phone', 'problem', 'doctor', 'specialty', 'date_key', 'time_key', 'date', 'time', 'booked_at'];
+const CSV_HEADERS = ['token', 'name', 'phone', 'problem', 'doctor', 'specialty', 'date_key', 'time_key', 'date', 'time', 'booked_at', 'email'];
 
 function ensureCsv() {
   if (!fs.existsSync(CSV_PATH)) {
@@ -93,13 +94,13 @@ async function appendToGoogleSheet(row) {
     const sheets = await getSheetsClient();
     await sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A:K',
+      range: 'Sheet1!A:L',
       valueInputOption: 'USER_ENTERED',
       requestBody: {
         values: [[
           row.token, row.name, row.phone, row.problem,
           row.doctor, row.specialty, row.date, row.time, row.booked_at,
-          row.date_key || '', row.time_key || '',
+          row.date_key || '', row.time_key || '', row.email || '',
         ]],
       },
     });
@@ -156,7 +157,7 @@ async function getAllAppointments() {
     const sheets = await getSheetsClient();
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A2:K',
+      range: 'Sheet1!A2:L',
     });
     const rows = result.data.values || [];
     const cancelledKeys = await getCancelledKeys();
@@ -174,6 +175,7 @@ async function getAllAppointments() {
         booked_at: r[8],
         date_key: r[9] || '',
         time_key: r[10] || '',
+        email: r[11] || '',
       }))
       .filter((a) => !cancelledKeys.has(`${a.token}_${a.date_key}_${a.time_key}`));
   } catch (err) {
@@ -419,7 +421,7 @@ function normalizeTimeKey(input) {
 }
 
 app.post('/api/check-and-book', async (req, res) => {
-  const { name, phone, problem, doctor_name, requested_date, requested_time } = req.body;
+  const { name, phone, problem, doctor_name, requested_date, requested_time, email } = req.body;
   console.log('--- check-and-book called ---');
   console.log('Received body:', JSON.stringify(req.body));
 
@@ -480,6 +482,7 @@ app.post('/api/check-and-book', async (req, res) => {
     date: formatDateDisplay(dateKey),
     time: formatTimeDisplay(timeKey),
     booked_at: new Date().toISOString(),
+    email: email || '',
   };
   await saveAppointment(row);
 
@@ -567,6 +570,15 @@ app.post('/whatsapp-webhook', async (req, res) => {
 app.get('/', (req, res) => res.send('Clinic voice agent backend chal raha hai.'));
 
 // ---------------- Dashboard (today's appointments, cleanly displayed) ----------------
+app.post('/api/dashboard-cancel', async (req, res) => {
+  const { token, date_key, time_key, phone } = req.body;
+  if (!token || !date_key || !time_key) {
+    return res.json({ success: false, message: 'Missing token/date/time.' });
+  }
+  await markCancelled(token, date_key, time_key, phone || '');
+  res.json({ success: true });
+});
+
 app.get('/dashboard', async (req, res) => {
   const appts = await getAllAppointments();
 
@@ -589,15 +601,21 @@ app.get('/dashboard', async (req, res) => {
           <td>${a.phone || ''}</td>
           <td>${a.problem || ''}</td>
           <td>${a.doctor || ''}</td>
+          <td>
+            <button class="cancel-btn"
+              data-token="${a.token}"
+              data-date-key="${a.date_key}"
+              data-time-key="${a.time_key}"
+              data-phone="${a.phone || ''}">Cancel</button>
+          </td>
         </tr>`).join('')
-    : `<tr><td colspan="6" class="empty">No appointments today.</td></tr>`;
+    : `<tr><td colspan="7" class="empty">No appointments today.</td></tr>`;
 
   res.send(`<!DOCTYPE html>
 <html lang="hi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="120">
 <title>Sanjeevani Clinic — Today's Appointments</title>
 <style>
   body{ font-family: -apple-system, 'Segoe UI', sans-serif; background:#F2F6F3; margin:0; padding:24px; color:#1B2420; }
@@ -609,17 +627,54 @@ app.get('/dashboard', async (req, res) => {
   tr:last-child td{ border-bottom:none; }
   .token{ font-weight:600; color:#B98B2E; }
   .empty{ text-align:center; color:#4B5A53; font-style:italic; padding:24px; }
+  .cancel-btn{ background:#9A4B3E; color:#fff; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-size:12.5px; }
+  .cancel-btn:hover{ background:#7d3c31; }
+  .cancel-btn:disabled{ background:#ccc; cursor:default; }
 </style>
 </head>
 <body>
   <h1>Sanjeevani Clinic — Today's Appointments</h1>
-  <p class="sub">${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} — Refreshes automatically every 2 minutes</p>
+  <p class="sub">${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</p>
   <table>
     <thead>
-      <tr><th>Token</th><th>Time</th><th>Name</th><th>Phone</th><th>Issue</th><th>Doctor</th></tr>
+      <tr><th>Token</th><th>Time</th><th>Name</th><th>Phone</th><th>Issue</th><th>Doctor</th><th>Action</th></tr>
     </thead>
     <tbody>${rowsHtml}</tbody>
   </table>
+<script>
+document.querySelectorAll('.cancel-btn').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const sure = confirm('Cancel this appointment (Token T' + btn.dataset.token + ')?');
+    if (!sure) return;
+    btn.disabled = true;
+    btn.textContent = 'Cancelling...';
+    try {
+      const res = await fetch('/api/dashboard-cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: btn.dataset.token,
+          date_key: btn.dataset.dateKey,
+          time_key: btn.dataset.timeKey,
+          phone: btn.dataset.phone,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        btn.closest('tr').remove();
+      } else {
+        alert('Could not cancel: ' + (data.message || 'unknown error'));
+        btn.disabled = false;
+        btn.textContent = 'Cancel';
+      }
+    } catch (e) {
+      alert('Network error, try again.');
+      btn.disabled = false;
+      btn.textContent = 'Cancel';
+    }
+  });
+});
+</script>
 </body>
 </html>`);
 });
@@ -663,6 +718,41 @@ async function sendWhatsAppMessage(toPhoneRaw, message) {
   }
 }
 
+let emailTransporterPromise = null;
+function getEmailTransporter() {
+  if (!emailTransporterPromise) {
+    emailTransporterPromise = Promise.resolve(
+      nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: process.env.GMAIL_USER,
+          pass: process.env.GMAIL_APP_PASSWORD,
+        },
+      })
+    );
+  }
+  return emailTransporterPromise;
+}
+
+async function sendEmailReminder(toEmail, subject, message) {
+  if (!toEmail || !toEmail.includes('@')) return { skipped: true, reason: 'no valid email' };
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+    return { skipped: true, reason: 'email not configured' };
+  }
+  try {
+    const transporter = await getEmailTransporter();
+    await transporter.sendMail({
+      from: `"Sanjeevani Clinic" <${process.env.GMAIL_USER}>`,
+      to: toEmail,
+      subject,
+      text: message,
+    });
+    return { sent: true };
+  } catch (err) {
+    return { sent: false, error: err.message };
+  }
+}
+
 const REMINDER_STAGES = [
   { key: '1day', minutesBefore: 24 * 60, windowMin: 15, label: '1 din pehle' },
   { key: '1hour', minutesBefore: 60, windowMin: 10, label: '1 ghanta pehle' },
@@ -692,7 +782,8 @@ app.get('/run-reminders', async (req, res) => {
             ? `Namaste ${appt.name}, aapka number aane wala hai. Token #${appt.token}, ${appt.doctor} ke saath, ${appt.time} baje.`
             : `Namaste ${appt.name}, ${stage.label} yaad dilana chahte hain — aapki appointment ${appt.date} ko ${appt.time} baje ${appt.doctor} ke saath hai. Token #${appt.token}.`;
 
-        const result = await sendWhatsAppMessage(appt.phone, message);
+        const subject = `Sanjeevani Clinic — Appointment Reminder (Token T${appt.token})`;
+        const result = await sendEmailReminder(appt.email, subject, message);
         markReminderSent(reminderKey);
         results.push({ token: appt.token, stage: stage.key, ...result });
       }
