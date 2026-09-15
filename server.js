@@ -384,6 +384,40 @@ function isValidIndianPhone(phone) {
   return digits.length === 10;
 }
 
+function normalizeDateKey(input) {
+  const s = (input || '').trim();
+  let m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) {
+    const [, dd, mm, yyyy] = m;
+    return `${dd.padStart(2, '0')}-${mm.padStart(2, '0')}-${yyyy}`;
+  }
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
+  if (m) {
+    const [, dd, mm, yy] = m;
+    const yyyy = 2000 + parseInt(yy, 10);
+    return `${dd.padStart(2, '0')}-${mm.padStart(2, '0')}-${yyyy}`;
+  }
+  return s; // unrecognized format, leave as-is
+}
+
+function normalizeTimeKey(input) {
+  const s = (input || '').trim().toLowerCase();
+  let m = s.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/);
+  if (m) {
+    let hh = parseInt(m[1], 10);
+    const mm = m[2];
+    const ap = m[3];
+    if (ap === 'pm' && hh !== 12) hh += 12;
+    if (ap === 'am' && hh === 12) hh = 0;
+    return `${String(hh).padStart(2, '0')}:${mm}`;
+  }
+  m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (m) {
+    return `${m[1].padStart(2, '0')}:${m[2]}`;
+  }
+  return s; // unrecognized format, leave as-is
+}
+
 app.post('/api/check-and-book', async (req, res) => {
   const { name, phone, problem, doctor_name, requested_date, requested_time } = req.body;
   console.log('--- check-and-book called ---');
@@ -398,8 +432,8 @@ app.post('/api/check-and-book', async (req, res) => {
   }
 
   const doctor = DOCTORS.find((d) => d.name === doctor_name) || DOCTORS[0];
-  const dateKey = (requested_date || '').trim();
-  const timeKey = (requested_time || '').trim();
+  const dateKey = normalizeDateKey(requested_date || '');
+  const timeKey = normalizeTimeKey(requested_time || '');
 
   const dm = dateKey.match(/^(\d{2})-(\d{2})-(\d{4})$/);
   if (dm) {
